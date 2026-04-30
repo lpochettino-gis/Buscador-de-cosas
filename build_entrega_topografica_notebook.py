@@ -60,6 +60,7 @@ Ejecuta esta celda completa. Define lectura, validacion, revision, transformacio
 helpers_code = r"""
 from pathlib import Path
 from datetime import datetime
+import csv
 import math
 import os
 import re
@@ -112,6 +113,16 @@ CRS_OPTIONS = [
 
 
 CATEGORY_RULES = [
+    ("TRAZA_PK", ["PK"], "#d32f2f", 1, "diamond", "http://maps.google.com/mapfiles/kml/paddle/red-diamond.png"),
+    ("BERMA", ["BERMA"], "#8d6e63", 30, "square", "http://maps.google.com/mapfiles/kml/paddle/brn-square.png"),
+    ("DIQUE", ["DIQUE"], "#00897b", 4, "triangle", "http://maps.google.com/mapfiles/kml/paddle/grn-diamond.png"),
+    ("MOJON", ["MOJON", "MOJÓN"], "#3949ab", 5, "target", "http://maps.google.com/mapfiles/kml/shapes/target.png"),
+    ("CARTEL", ["CARTEL"], "#f9a825", 2, "square", "http://maps.google.com/mapfiles/kml/shapes/info-i.png"),
+    ("SOLDADURA", ["SOLD", "SOLDADURA"], "#ad1457", 6, "x", "http://maps.google.com/mapfiles/kml/paddle/pink-circle.png"),
+    ("MUERTO_ANCLAJE", ["MUERTO", "ANCLAJE"], "#5d4037", 30, "diamond", "http://maps.google.com/mapfiles/kml/shapes/caution.png"),
+    ("BRIDA", ["BRIDA"], "#e64a19", 1, "circle", "http://maps.google.com/mapfiles/kml/paddle/orange-circle.png"),
+    ("PLATINA", ["PLATINA"], "#7b1fa2", 6, "square", "http://maps.google.com/mapfiles/kml/paddle/purple-square.png"),
+    ("ESTRELLA", ["ESTRELLA"], "#fbc02d", 2, "target", "http://maps.google.com/mapfiles/kml/paddle/ylw-stars.png"),
     ("TN", ["TN", "TERRENO", "NATURAL", "SUELO"], "#2e7d32", 3, "circle", "http://maps.google.com/mapfiles/kml/paddle/grn-circle.png"),
     ("CONTROL", ["PF", "PUNTO FIJO", "CONTROL", "BASE", "BM", "IGN"], "#c62828", 1, "target", "http://maps.google.com/mapfiles/kml/shapes/target.png"),
     ("EJE", ["EJE", "AXIS", "CENTER", "CENTRO"], "#1565c0", 5, "triangle", "http://maps.google.com/mapfiles/kml/paddle/blu-diamond.png"),
@@ -175,6 +186,21 @@ def numeric_series(series):
     return series.apply(parse_number)
 
 
+def numeric_ratio(series, max_rows=80):
+    sample = series.dropna().head(max_rows)
+    if len(sample) == 0:
+        return 0.0
+    ok = 0
+    for value in sample:
+        try:
+            parsed = parse_number(value)
+            if np.isfinite(parsed):
+                ok += 1
+        except Exception:
+            pass
+    return ok / len(sample)
+
+
 def _header_looks_like_data(columns):
     cols = [str(c).strip() for c in columns]
     if not cols:
@@ -200,17 +226,17 @@ def read_points_file(path):
     last_error = None
     for enc in encodings:
         try:
-            df = pd.read_csv(path, sep=None, engine="python", encoding=enc)
+            df = pd.read_csv(path, sep=None, engine="python", encoding=enc, quoting=csv.QUOTE_NONE)
             if len(df.columns) == 1:
                 for sep in [";", ",", "\t", r"\s+"]:
-                    df = pd.read_csv(path, sep=sep, engine="python", encoding=enc)
+                    df = pd.read_csv(path, sep=sep, engine="python", encoding=enc, quoting=csv.QUOTE_NONE)
                     if len(df.columns) > 1:
                         break
             if _header_looks_like_data(df.columns):
-                df = pd.read_csv(path, sep=None, engine="python", encoding=enc, header=None)
+                df = pd.read_csv(path, sep=None, engine="python", encoding=enc, header=None, quoting=csv.QUOTE_NONE)
                 if len(df.columns) == 1:
                     for sep in [";", ",", "\t", r"\s+"]:
-                        df = pd.read_csv(path, sep=sep, engine="python", encoding=enc, header=None)
+                        df = pd.read_csv(path, sep=sep, engine="python", encoding=enc, header=None, quoting=csv.QUOTE_NONE)
                         if len(df.columns) > 1:
                             break
                 df.columns = [f"C{i + 1}" for i in range(len(df.columns))]
@@ -241,6 +267,132 @@ def guess_column(df, candidates):
     return df.columns[0] if len(df.columns) else None
 
 
+def is_generic_columns(df):
+    return all(re.fullmatch(r"C\d+", str(col)) for col in df.columns)
+
+
+def infer_crs_and_axis(col_a, col_b):
+    a = pd.to_numeric(col_a.apply(parse_number), errors="coerce").dropna()
+    b = pd.to_numeric(col_b.apply(parse_number), errors="coerce").dropna()
+    if a.empty or b.empty:
+        return {"input_crs": "EPSG:5344", "axis_order": "unknown", "confidence": "baja", "note": "No hay suficientes coordenadas numericas para detectar CRS."}
+
+    ma = float(a.median())
+    mb = float(b.median())
+    aa = abs(ma)
+    ab = abs(mb)
+
+    if aa <= 180 and ab <= 90:
+        return {"input_crs": "EPSG:4326", "axis_order": "east_north", "confidence": "alta", "note": "Parece longitud/latitud WGS84."}
+    if aa <= 90 and ab <= 180:
+        return {"input_crs": "EPSG:4326", "axis_order": "north_east", "confidence": "alta", "note": "Parece latitud/longitud WGS84."}
+
+    def gk_zone(value):
+        zone = int(abs(value) // 1_000_000)
+        return zone if 1 <= zone <= 7 else None
+
+    zone_b = gk_zone(mb)
+    if 5_000_000 <= aa <= 7_500_000 and zone_b:
+        return {
+            "input_crs": f"EPSG:{5342 + zone_b}",
+            "axis_order": "north_east",
+            "confidence": "alta",
+            "note": f"Detectado POSGAR 2007 / Argentina {zone_b}: primera coordenada Norte, segunda Este.",
+        }
+
+    zone_a = gk_zone(ma)
+    if 5_000_000 <= ab <= 7_500_000 and zone_a:
+        return {
+            "input_crs": f"EPSG:{5342 + zone_a}",
+            "axis_order": "east_north",
+            "confidence": "alta",
+            "note": f"Detectado POSGAR 2007 / Argentina {zone_a}: primera coordenada Este, segunda Norte.",
+        }
+
+    if 120_000 <= aa <= 900_000 and 0 <= ab <= 10_000_000:
+        return {"input_crs": "EPSG:32720", "axis_order": "east_north", "confidence": "media", "note": "Parece UTM sur. Confirma la zona EPSG."}
+    if 120_000 <= ab <= 900_000 and 0 <= aa <= 10_000_000:
+        return {"input_crs": "EPSG:32720", "axis_order": "north_east", "confidence": "media", "note": "Parece UTM sur con Norte/Este. Confirma la zona EPSG."}
+
+    return {"input_crs": "EPSG:5344", "axis_order": "unknown", "confidence": "baja", "note": "No pude detectar el CRS con seguridad. Revisa EPSG y orden de ejes."}
+
+
+def auto_detect_file_config(file_item):
+    df = file_item["df"]
+    cols = list(df.columns)
+    detection = {
+        "archivo": file_item["name"],
+        "point_col": None,
+        "x_col": None,
+        "y_col": None,
+        "z_col": None,
+        "desc_col": None,
+        "swap_xy": False,
+        "input_crs": "EPSG:5344",
+        "organization": "custom",
+        "confidence": "baja",
+        "note": "Deteccion pendiente.",
+    }
+    if len(cols) >= 5 and is_generic_columns(df):
+        detection.update({"point_col": cols[0], "z_col": cols[3], "desc_col": cols[4]})
+        axis = infer_crs_and_axis(df[cols[1]], df[cols[2]])
+        detection.update({"input_crs": axis["input_crs"], "confidence": axis["confidence"], "note": axis["note"]})
+        if axis["axis_order"] == "north_east":
+            detection.update({"x_col": cols[2], "y_col": cols[1], "organization": "northing_first"})
+        else:
+            detection.update({"x_col": cols[1], "y_col": cols[2], "organization": "standard"})
+        return detection
+
+    point_col = guess_column(df, ["PTO", "PUNTO", "POINT", "ID", "NRO", "NUMERO", "Column1"])
+    z_col = guess_column(df, ["Z", "COTA", "ELEV", "ELEVACION", "ALTURA", "ALT", "Column4"])
+    desc_col = guess_column(df, ["DESC", "DESCRIPCION", "CODIGO", "CODE", "OBS", "DETALLE", "Column5"])
+
+    numeric_cols = [col for col in cols if numeric_ratio(df[col]) >= 0.7]
+    coord_candidates = [col for col in numeric_cols if col != z_col]
+    if point_col in coord_candidates and len(coord_candidates) > 2:
+        coord_candidates.remove(point_col)
+    if len(coord_candidates) >= 2:
+        a_col, b_col = coord_candidates[0], coord_candidates[1]
+        axis = infer_crs_and_axis(df[a_col], df[b_col])
+        detection.update({"input_crs": axis["input_crs"], "confidence": axis["confidence"], "note": axis["note"]})
+        if axis["axis_order"] == "north_east":
+            x_col, y_col, org = b_col, a_col, "northing_first"
+        else:
+            x_col, y_col, org = a_col, b_col, "standard"
+    else:
+        x_col = guess_column(df, ["ESTE", "EAST", "EASTING", "E", "LONGITUD", "LON", "X", "Column3"])
+        y_col = guess_column(df, ["NORTE", "NORTH", "NORTHING", "N", "LATITUD", "LAT", "Y", "Column2"])
+        org = "custom"
+
+    detection.update({
+        "point_col": point_col,
+        "x_col": x_col,
+        "y_col": y_col,
+        "z_col": z_col,
+        "desc_col": desc_col,
+        "organization": org,
+    })
+    return detection
+
+
+def detection_summary(file_items):
+    rows = []
+    for item in file_items:
+        det = auto_detect_file_config(item)
+        rows.append({
+            "archivo": item["name"],
+            "CRS detectado": det["input_crs"],
+            "organizacion": det["organization"],
+            "Este/Lon": det["x_col"],
+            "Norte/Lat": det["y_col"],
+            "Z": det["z_col"],
+            "descripcion": det["desc_col"],
+            "confianza": det["confidence"],
+            "nota": det["note"],
+        })
+    return pd.DataFrame(rows)
+
+
 def resolve_col_by_position(base_df, target_df, base_col):
     if base_col is None:
         return None
@@ -263,7 +415,11 @@ def get_cell(row, col):
 
 
 def classify_description(desc):
-    text = str(desc or "").upper()
+    text = str(desc or "").strip().strip('"').upper()
+    text_norm = re.sub(r"\s+", "", text)
+    if re.match(r"^PK\d+/", text_norm):
+        name, color, aci, marker, icon = ("TRAZA_PK", "#d32f2f", 1, "diamond", "http://maps.google.com/mapfiles/kml/paddle/red-diamond.png")
+        return {"categoria": name, "color": color, "aci": aci, "marker": marker, "icon": icon}
     for name, keywords, color, aci, marker, icon in CATEGORY_RULES:
         if any(keyword in text for keyword in keywords):
             return {"categoria": name, "color": color, "aci": aci, "marker": marker, "icon": icon}
@@ -469,6 +625,101 @@ def create_contours(points, interval, tn_pattern=r"\bTN\b", max_grid=240):
     return contours, f"Curvas generadas: {len(contours)} segmentos en {len(levels)} niveles."
 
 
+def parse_pk_descriptor(desc):
+    text = str(desc or "").strip().strip('"').upper().replace(" ", "")
+    match = re.match(r"^(PK\d+)/(.*)$", text)
+    if not match:
+        return None
+    pk = match.group(1)
+    suffix = match.group(2)
+    order_match = re.search(r"(\d+)", suffix)
+    order = int(order_match.group(1)) if order_match else 0
+    return {"group": pk, "suffix": suffix, "order": order}
+
+
+def build_feature_lines(points):
+    lines = []
+    if points.empty:
+        return lines
+
+    pk_rows = []
+    for idx, row in points.iterrows():
+        parsed = parse_pk_descriptor(row.get("descripcion", ""))
+        if parsed:
+            pk_rows.append({
+                "idx": idx,
+                "source_file": row["source_file"],
+                "group": parsed["group"],
+                "order": parsed["order"],
+                "source_row": row["source_row"],
+                "x": float(row["x"]),
+                "y": float(row["y"]),
+                "z": None if pd.isna(row["z"]) else float(row["z"]),
+            })
+
+    if pk_rows:
+        pk_df = pd.DataFrame(pk_rows)
+        for (source_file, group), g in pk_df.groupby(["source_file", "group"], sort=False):
+            g = g.sort_values(["order", "source_row"])
+            if len(g) >= 2:
+                coords = [(float(r.x), float(r.y), r.z) for r in g.itertuples(index=False)]
+                lines.append({
+                    "name": f"{Path(source_file).stem} - {group}",
+                    "category": "TRAZA_PK",
+                    "layer": f"LINEA_{group}",
+                    "color": "#d32f2f",
+                    "aci": 1,
+                    "coords": coords,
+                    "closed": False,
+                })
+
+    berma = points[points["categoria"] == "BERMA"].copy()
+    if not berma.empty:
+        for (source_file, desc), g in berma.groupby(["source_file", "descripcion"], sort=False):
+            if len(g) >= 3:
+                g = g.sort_values("source_row")
+                coords = [(float(r.x), float(r.y), None if pd.isna(r.z) else float(r.z)) for r in g.itertuples(index=False)]
+                lines.append({
+                    "name": f"{desc}",
+                    "category": "BERMA",
+                    "layer": "LINEA_BERMA",
+                    "color": "#8d6e63",
+                    "aci": 30,
+                    "coords": coords,
+                    "closed": True,
+                })
+
+    dique_rows = []
+    for _, row in points[points["categoria"] == "DIQUE"].iterrows():
+        text = str(row["descripcion"]).upper()
+        match = re.search(r"DIQUE\s*(\d+)", text)
+        if match:
+            dique_rows.append({
+                "source_file": row["source_file"],
+                "group": f"DIQUE_{match.group(1)}",
+                "source_row": row["source_row"],
+                "x": float(row["x"]),
+                "y": float(row["y"]),
+                "z": None if pd.isna(row["z"]) else float(row["z"]),
+            })
+    if dique_rows:
+        dique_df = pd.DataFrame(dique_rows)
+        for (source_file, group), g in dique_df.groupby(["source_file", "group"], sort=False):
+            if len(g) >= 2:
+                g = g.sort_values("source_row")
+                coords = [(float(r.x), float(r.y), r.z) for r in g.itertuples(index=False)]
+                lines.append({
+                    "name": group.replace("_", " "),
+                    "category": "DIQUE",
+                    "layer": "LINEA_DIQUE",
+                    "color": "#00897b",
+                    "aci": 4,
+                    "coords": coords,
+                    "closed": False,
+                })
+    return lines
+
+
 def nice_number(value):
     if value <= 0 or not np.isfinite(value):
         return 1.0
@@ -594,7 +845,7 @@ def plot_marker(ax, x, y, marker, color, size=28, label=None):
     ax.scatter([x], [y], s=size, marker=mpl_marker, color=color, edgecolors="black", linewidths=0.35, label=label, zorder=4)
 
 
-def make_plan_figure(points, contours, annotations, output_crs, project_name, interval, label_points=True, use_basemap=True, basemap_provider="OpenStreetMap"):
+def make_plan_figure(points, contours, feature_lines, annotations, output_crs, project_name, interval, label_points=True, use_basemap=True, basemap_provider="OpenStreetMap"):
     fig, ax = plt.subplots(figsize=(16.5, 11.7))
 
     minx, maxx = points["x"].min(), points["x"].max()
@@ -618,6 +869,15 @@ def make_plan_figure(points, contours, annotations, output_crs, project_name, in
             if is_major and len(coords) > 6:
                 mid = coords[len(coords) // 2]
                 ax.text(mid[0], mid[1], f"{level:.2f}", fontsize=6, color=color, ha="center", va="center", bbox={"facecolor": "white", "alpha": 0.72, "edgecolor": "none", "pad": 0.5}, zorder=5)
+
+    for line in feature_lines:
+        coords = np.array([(pt[0], pt[1]) for pt in line["coords"]], dtype=float)
+        if len(coords) < 2:
+            continue
+        if line.get("closed") and len(coords) >= 3:
+            coords = np.vstack([coords, coords[0]])
+        lw = 1.6 if line["category"] == "TRAZA_PK" else 1.05
+        ax.plot(coords[:, 0], coords[:, 1], color=line["color"], linewidth=lw, zorder=3.2, label=line["category"] if line["category"] not in ax.get_legend_handles_labels()[1] else None)
 
     for _, group in points.groupby("categoria"):
         first = group.iloc[0]
@@ -665,6 +925,7 @@ def make_plan_figure(points, contours, annotations, output_crs, project_name, in
         f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         f"CRS salida: {output_crs.to_string()}",
         f"Puntos: {len(points)}",
+        f"Polilineas: {len(feature_lines)}",
         f"Curvas: {'si' if contours else 'no'}",
         f"Equidistancia: {interval:g} m" if contours else "Equidistancia: sin curvas",
     ]
@@ -679,6 +940,7 @@ def build_pdf_report(pdf_path, result):
         fig = make_plan_figure(
             points,
             result["contours"],
+            result["feature_lines"],
             result["annotations"],
             result["output_crs"],
             result["project_name"],
@@ -772,6 +1034,7 @@ def add_dxf_text(msp, text, x, y, z, height, layer):
 def export_dxf(path, result):
     points = result["points"]
     contours = result["contours"]
+    feature_lines = result["feature_lines"]
     annotations = result["annotations"]
     interval = result["interval"]
     doc = ezdxf.new("R2010")
@@ -782,7 +1045,7 @@ def export_dxf(path, result):
         layer_name = f"PUNTOS_{row['categoria']}"
         if layer_name not in doc.layers:
             doc.layers.add(layer_name, color=int(row["aci"]))
-    for layer_name, color in [("CURVAS_NIVEL", 34), ("CURVAS_MAESTRAS", 32), ("TEXTOS", 7), ("COTAS", 1)]:
+    for layer_name, color in [("CURVAS_NIVEL", 34), ("CURVAS_MAESTRAS", 32), ("LINEA_PK", 1), ("LINEA_BERMA", 30), ("LINEA_DIQUE", 4), ("TEXTOS", 7), ("COTAS", 1)]:
         if layer_name not in doc.layers:
             doc.layers.add(layer_name, color=color)
 
@@ -814,6 +1077,18 @@ def export_dxf(path, result):
             mid = pts[len(pts) // 2]
             add_dxf_text(msp, f"{level:.2f}", mid[0], mid[1], level, text_height * 0.85, layer)
 
+    for line in feature_lines:
+        layer = "LINEA_PK" if line["category"] == "TRAZA_PK" else line.get("layer", "LINEA_PK")
+        if layer not in doc.layers:
+            doc.layers.add(layer, color=int(line.get("aci", 7)))
+        pts = [(float(x), float(y), 0 if z is None else float(z)) for x, y, z in line["coords"]]
+        if line.get("closed") and len(pts) >= 3:
+            pts = pts + [pts[0]]
+        if len(pts) >= 2:
+            msp.add_polyline3d(pts, dxfattribs={"layer": layer})
+            mid = pts[len(pts) // 2]
+            add_dxf_text(msp, line["name"], mid[0], mid[1], mid[2], text_height, layer)
+
     for ann in annotations:
         p1, p2, label = ann["p1"], ann["p2"], ann["label"]
         msp.add_line((p1[0], p1[1], 0), (p2[0], p2[1], 0), dxfattribs={"layer": "COTAS"})
@@ -827,6 +1102,7 @@ def export_dxf(path, result):
 def export_kmz(path, result):
     points = result["points"]
     contours = result["contours"]
+    feature_lines = result["feature_lines"]
     output_crs = result["output_crs"]
     kml = simplekml.Kml(name=result["project_name"])
     transformer = Transformer.from_crs(output_crs, CRS.from_epsg(4326), always_xy=True)
@@ -866,6 +1142,25 @@ def export_kmz(path, result):
             line.altitudemode = simplekml.AltitudeMode.clamptoground
             line.style = contour_style
 
+    if feature_lines:
+        line_folder = kml.newfolder(name="Polilineas detectadas")
+        styles_by_cat = {}
+        for feature in feature_lines:
+            if feature["category"] not in styles_by_cat:
+                style = simplekml.Style()
+                r, g, b = hex_to_rgb(feature["color"])
+                style.linestyle.color = simplekml.Color.rgb(r, g, b, 255)
+                style.linestyle.width = 2.5 if feature["category"] == "TRAZA_PK" else 1.8
+                styles_by_cat[feature["category"]] = style
+            coords = []
+            raw_coords = feature["coords"] + ([feature["coords"][0]] if feature.get("closed") and len(feature["coords"]) >= 3 else [])
+            for x, y, z in raw_coords:
+                lon, lat = transformer.transform(float(x), float(y))
+                coords.append((lon, lat, 0 if z is None else float(z)))
+            line = line_folder.newlinestring(name=feature["name"], coords=coords)
+            line.altitudemode = simplekml.AltitudeMode.clamptoground
+            line.style = styles_by_cat[feature["category"]]
+
     kml.savekmz(path)
 
 
@@ -881,6 +1176,7 @@ def export_excel(path, result):
 def export_folium_map(path, result):
     points = result["points"]
     contours = result["contours"]
+    feature_lines = result["feature_lines"]
     output_crs = result["output_crs"]
     transformer = Transformer.from_crs(output_crs, CRS.from_epsg(4326), always_xy=True)
     lon, lat = transformer.transform(points["x"].mean(), points["y"].mean())
@@ -893,6 +1189,17 @@ def export_folium_map(path, result):
             lon, lat = transformer.transform(float(row["x"]), float(row["y"]))
             popup = f"<b>{row['punto']}</b><br>Archivo: {row['source_file']}<br>{row['descripcion']}<br>Cota: {format_z(row['z'])}"
             folium.CircleMarker(location=[lat, lon], radius=4, color=row["color"], fill=True, fill_color=row["color"], fill_opacity=0.85, popup=popup).add_to(fg)
+        fg.add_to(fmap)
+
+    if feature_lines:
+        fg = folium.FeatureGroup(name="Polilineas detectadas", show=True)
+        for feature in feature_lines:
+            coords = []
+            raw_coords = feature["coords"] + ([feature["coords"][0]] if feature.get("closed") and len(feature["coords"]) >= 3 else [])
+            for x, y, z in raw_coords:
+                lon, lat = transformer.transform(float(x), float(y))
+                coords.append([lat, lon])
+            folium.PolyLine(coords, color=feature["color"], weight=3 if feature["category"] == "TRAZA_PK" else 2, opacity=0.9, tooltip=feature["name"]).add_to(fg)
         fg.add_to(fmap)
 
     if contours:
@@ -943,6 +1250,7 @@ def prepare_project_result(file_items, file_configs, project_config, review_stat
     points = pd.concat(all_points, ignore_index=True)
     qc = quality_checks(points, dropped_total)
     contours, contour_message = create_contours(points, project_config["interval"], project_config["tn_pattern"])
+    feature_lines = build_feature_lines(points)
     annotations = make_distance_annotations(points, output_crs)
 
     return {
@@ -951,6 +1259,7 @@ def prepare_project_result(file_items, file_configs, project_config, review_stat
         "qc": qc,
         "contours": contours,
         "contour_message": contour_message,
+        "feature_lines": feature_lines,
         "annotations": annotations,
         "output_crs": output_crs,
         "interval": project_config["interval"],
@@ -999,6 +1308,10 @@ summary = pd.DataFrame([
 ])
 display(Markdown("### Archivos cargados"))
 display(summary)
+
+auto_detection_table = detection_summary(loaded_files)
+display(Markdown("### Deteccion automatica inicial"))
+display(auto_detection_table)
 
 tabs = []
 titles = []
@@ -1059,11 +1372,22 @@ wide = widgets.Layout(width="620px")
 mid = widgets.Layout(width="420px")
 style = {"description_width": "170px"}
 
+auto_detections = {item["name"]: auto_detect_file_config(item) for item in loaded_files}
+detected_crs_values = [det["input_crs"] for det in auto_detections.values() if det.get("input_crs")]
+default_input_crs = detected_crs_values[0] if detected_crs_values else "EPSG:5344"
+default_output_crs = default_input_crs if default_input_crs in [value for _, value in CRS_OPTIONS] else "CUSTOM"
+same_detected_crs = len(set(detected_crs_values)) <= 1
+
+display(Markdown("### Confirmacion rapida"))
+display(Markdown("La herramienta ya intento detectar columnas, orden de ejes y CRS. Si algo no coincide, abre **Ajustes avanzados** y corrige solo ese punto."))
+display(detection_summary(loaded_files))
+
 project_w = widgets.Text(value="Entrega topografica", description="Nombre del plano", style=style, layout=wide)
+auto_mode_w = widgets.Checkbox(value=True, description="Usar deteccion automatica")
 same_format_w = widgets.Checkbox(value=True, description="Mismo formato de columnas para todos")
-same_crs_w = widgets.Checkbox(value=True, description="Mismo CRS de entrada para todos")
-output_crs_w = widgets.Dropdown(options=CRS_OPTIONS, value="EPSG:5347", description="CRS salida", style=style, layout=wide)
-output_custom_w = widgets.Text(value="", description="CRS salida custom", placeholder="Ej: EPSG:5347", style=style, layout=wide)
+same_crs_w = widgets.Checkbox(value=same_detected_crs, description="Mismo CRS de entrada para todos")
+output_crs_w = widgets.Dropdown(options=CRS_OPTIONS, value=default_output_crs, description="CRS salida", style=style, layout=wide)
+output_custom_w = widgets.Text(value=default_input_crs if default_output_crs == "CUSTOM" else "", description="CRS salida custom", placeholder="Ej: EPSG:5347", style=style, layout=wide)
 interval_w = widgets.FloatText(value=0.50, description="Equidistancia", style=style, layout=mid)
 tn_pattern_w = widgets.Text(value=r"\bTN\b", description="Patron TN", style=style, layout=mid)
 label_points_w = widgets.Checkbox(value=True, description="Etiquetar puntos en PDF/DXF")
@@ -1073,6 +1397,7 @@ basemap_provider_w = widgets.Dropdown(options=["OpenStreetMap", "CartoDB Positro
 
 def make_file_widget_set(item, title):
     df = item["df"]
+    det = auto_detections[item["name"]] if item["name"] in auto_detections else auto_detect_file_config(item)
     col_options = [None] + list(df.columns)
     box_title = widgets.HTML(f"<div class='topo-panel'><b>{title}</b><br><span style='color:#57606a'>Filas: {len(df)} | Columnas: {len(df.columns)}</span></div>")
     organization_w = widgets.Dropdown(
@@ -1083,19 +1408,21 @@ def make_file_widget_set(item, title):
             ("Latitud, Longitud, Cota, Descripcion", "latlon"),
             ("Personalizado", "custom"),
         ],
-        value="standard",
+        value=det.get("organization", "standard") if det.get("organization", "custom") in ["standard", "northing_first", "lonlat", "latlon", "custom"] else "standard",
         description="Organizacion",
         style=style,
         layout=wide,
     )
-    input_crs_w = widgets.Dropdown(options=CRS_OPTIONS, value="EPSG:5347", description="CRS entrada", style=style, layout=wide)
-    input_custom_w = widgets.Text(value="", description="CRS entrada custom", placeholder="Ej: EPSG:32721", style=style, layout=wide)
-    point_w = widgets.Dropdown(options=col_options, value=guess_column(df, ["PTO", "PUNTO", "POINT", "ID", "NRO", "NUMERO"]), description="Punto / ID", style=style, layout=wide)
-    x_w = widgets.Dropdown(options=col_options, value=guess_column(df, ["ESTE", "EAST", "EASTING", "E", "LONGITUD", "LON", "X"]), description="Este / Lon", style=style, layout=wide)
-    y_w = widgets.Dropdown(options=col_options, value=guess_column(df, ["NORTE", "NORTH", "NORTHING", "N", "LATITUD", "LAT", "Y"]), description="Norte / Lat", style=style, layout=wide)
-    z_w = widgets.Dropdown(options=col_options, value=guess_column(df, ["Z", "COTA", "ELEV", "ELEVACION", "ALTURA", "ALT"]), description="Z / Cota", style=style, layout=wide)
-    desc_w = widgets.Dropdown(options=col_options, value=guess_column(df, ["DESC", "DESCRIPCION", "CODIGO", "CODE", "OBS", "DETALLE"]), description="Descripcion", style=style, layout=wide)
-    swap_xy_w = widgets.Checkbox(value=False, description="Intercambiar ejes al procesar")
+    input_value = det.get("input_crs", default_input_crs)
+    input_dropdown_value = input_value if input_value in [value for _, value in CRS_OPTIONS] else "CUSTOM"
+    input_crs_w = widgets.Dropdown(options=CRS_OPTIONS, value=input_dropdown_value, description="CRS entrada", style=style, layout=wide)
+    input_custom_w = widgets.Text(value=input_value if input_dropdown_value == "CUSTOM" else "", description="CRS entrada custom", placeholder="Ej: EPSG:32721", style=style, layout=wide)
+    point_w = widgets.Dropdown(options=col_options, value=det.get("point_col"), description="Punto / ID", style=style, layout=wide)
+    x_w = widgets.Dropdown(options=col_options, value=det.get("x_col"), description="Este / Lon", style=style, layout=wide)
+    y_w = widgets.Dropdown(options=col_options, value=det.get("y_col"), description="Norte / Lat", style=style, layout=wide)
+    z_w = widgets.Dropdown(options=col_options, value=det.get("z_col"), description="Z / Cota", style=style, layout=wide)
+    desc_w = widgets.Dropdown(options=col_options, value=det.get("desc_col"), description="Descripcion", style=style, layout=wide)
+    swap_xy_w = widgets.Checkbox(value=bool(det.get("swap_xy", False)), description="Intercambiar ejes al procesar")
 
     def on_org_change(change):
         if change["new"] in {"northing_first", "latlon"}:
@@ -1140,10 +1467,12 @@ accordion = widgets.Accordion(children=[common_widgets["panel"]] + [per_file_wid
 accordion.set_title(0, "Formato comun")
 for i, item in enumerate(loaded_files, start=1):
     accordion.set_title(i, item["name"][:40])
+accordion.selected_index = None
 
 display(widgets.VBox([
     widgets.HTML("<h3>Proyecto y salida</h3>"),
     project_w,
+    auto_mode_w,
     same_format_w,
     same_crs_w,
     output_crs_w,
@@ -1153,7 +1482,7 @@ display(widgets.VBox([
     label_points_w,
     use_basemap_w,
     basemap_provider_w,
-    widgets.HTML("<h3>Formato de archivos</h3>"),
+    widgets.HTML("<h3>Ajustes avanzados de archivos</h3>"),
     accordion,
 ]))
 
@@ -1176,7 +1505,19 @@ def collect_file_configs():
     base_item = loaded_files[0]
     common_cfg = widget_set_to_config(common_widgets)
     for item in loaded_files:
-        if same_format_w.value:
+        if auto_mode_w.value:
+            det = auto_detections[item["name"]]
+            cfg = {
+                "organization": det["organization"],
+                "input_crs": default_input_crs if same_crs_w.value else det["input_crs"],
+                "point_col": det["point_col"],
+                "x_col": det["x_col"],
+                "y_col": det["y_col"],
+                "z_col": det["z_col"],
+                "desc_col": det["desc_col"],
+                "swap_xy": bool(det.get("swap_xy", False)),
+            }
+        elif same_format_w.value:
             cfg = dict(common_cfg)
             cfg["point_col"] = resolve_col_by_position(base_item["df"], item["df"], common_cfg["point_col"])
             cfg["x_col"] = resolve_col_by_position(base_item["df"], item["df"], common_cfg["x_col"])
@@ -1413,6 +1754,7 @@ def show_preview(result):
         clear_output()
         display(Markdown("### Vista previa procesada"))
         display(Markdown(result["contour_message"]))
+        display(Markdown(f"**Polilineas detectadas:** {len(result['feature_lines'])}"))
         display(result["qc"])
         display(result["points"][["source_file", "source_row", "punto", "x", "y", "z", "descripcion", "categoria"]].head(20))
 
