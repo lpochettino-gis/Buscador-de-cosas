@@ -2,6 +2,14 @@
 
 Fecha: 2026-09-21. Se reprodujo la omisión de fotos sencillas con la configuración anterior y se probó la corrección con modelos reales.
 
+## Actualización de instalación: error `GenerationMixin`
+
+Se añadió una celda de instalación con comprobación de importaciones en un proceso limpio y reparación dirigida de Transformers y sus dependencias directas. Ahora se fija también tokenizers 0.22.2, huggingface-hub 0.36.2 y safetensors 0.8.0. Se comprueban `GenerationMixin` y el modelo Grounding DINO concreto sin descargar pesos. Si quedaron librerías antiguas en memoria, se exige reinicio antes de inferir. Un fallo persistente conserva el traceback para identificar la dependencia real; no se atribuye automáticamente a la imagen o a Python 3.13.
+
+**Uso después de actualizar:** reiniciar la sesión, ejecutar la celda 1 y esperar la comprobación. Si pide otro reinicio, hacerlo y continuar desde **2. Motor**, configuración e interfaz, sin reinstalar. Se probaron cinco regresiones del instalador además de las 24 pruebas existentes. La comprobación real de importación pasó en el entorno aislado Python 3.12; la sesión remota del usuario con Python 3.13 no está disponible para reproducir su estado exacto.
+
+También se ejecutó una reinstalación real de esos cuatro paquetes con NumPy previamente cargado: la comprobación terminó correctamente y se verificó el bloqueo hasta reiniciar la sesión.
+
 ## Cambio
 
 - Grounding DINO Tiny reemplaza a YOLO-World como motor predeterminado del agro. Revisión fijada: `a2bb814dd30d776dcf7e30523b00659f4f141c71`; Transformers 4.57.3; confianza 0.25.
